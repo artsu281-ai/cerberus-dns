@@ -1,0 +1,23 @@
+# macOS & Xcode
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Compiled Binaries & Build outputs
+Contents/MacOS/dnsblock
+*.o
+*.dylib
+*.out
+
+# User data & caches
+*.log
+.build/
+.swiftpm/
+
+# Встроенное VPN-ядро: ставится движком в ~/Library, в репозиторий не кладём
+Contents/Resources/bin/
+
+# Релизные архивы (tools/release.sh)
+dist/
