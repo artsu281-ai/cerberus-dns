@@ -1863,6 +1863,9 @@ class DNSManager: ObservableObject {
                 } else {
                     self.showBanner(tr("Не удалось выполнить удаление", "Removal failed", "Жок кылуу мүмкүн болгон жок"))
                 }
+                // Движок удаляет и помощник; без перепроверки интерфейс считал
+                // бы его установленным.
+                self.checkHelperStatus()
                 self.refreshStatus()
             }
         }

@@ -39,7 +39,6 @@ PROFILE_FILE="$STATE_DIR/profile"
 CUSTOM_DNS_FILE="$STATE_DIR/custom_dns"
 WHITELIST_FILE="$STATE_DIR/whitelist.txt"
 BLACKLIST_FILE="$STATE_DIR/blacklist.txt"
-PREFIX_FILE="$STATE_DIR/prefix"
 QUERY_LOG="/var/log/adblock-dns-queries.log"
 RESOLVER_DIR="/etc/resolver"
 TS_MARK="$STATE_DIR/tailscale_split"
@@ -47,6 +46,13 @@ TS_RESOLVER="$RESOLVER_DIR/ts.net"
 TS_DNS="100.100.100.100"
 DOH_MARK="$STATE_DIR/block_doh"
 LIBEXEC="/usr/local/libexec/adblock-dns-engine.sh"
+# dnsmasq работает от root, поэтому запускается root-копия, а не файл из
+# Homebrew: каталог Homebrew принадлежит пользователю, и любой его процесс мог
+# подменить бинарник или конфиг, которые затем исполнялись бы от root.
+# Имя файла — именно dnsmasq: по нему `pgrep -x dnsmasq` узнаёт, что служба работает.
+DNSMASQ_RUN="/usr/local/libexec/adblock-dns/dnsmasq"
+HELPER_BIN="/usr/local/bin/dnsblock-engine"
+HELPER_SUDOERS="/etc/sudoers.d/dnsblocker_helper"
 DNS_PLIST="/Library/LaunchDaemons/com.adblockdns.dnsmasq.plist"
 DNS_LABEL="com.adblockdns.dnsmasq"
 UPD_PLIST="/Library/LaunchDaemons/com.adblockdns.update.plist"
@@ -72,68 +78,71 @@ fail() { printf '%s  ✘ %s%s\n' "$RED" "$*" "$R"; }
 find_brew() {
   local p
   BREW=""; BREW_PREFIX=""; DNSMASQ_BIN=""
-  for p in /opt/homebrew/bin/brew /usr/local/bin/brew "$HOME/.homebrew/bin/brew" "$HOME/homebrew/bin/brew"; do
+  # HOME у фонового обновления из launchd не задан, а `set -u` прервал бы скрипт.
+  for p in /opt/homebrew/bin/brew /usr/local/bin/brew "${HOME:-/var/empty}/.homebrew/bin/brew" "${HOME:-/var/empty}/homebrew/bin/brew"; do
     if [ -x "$p" ]; then BREW="$p"; break; fi
   done
   [ -z "$BREW" ] && BREW="$(command -v brew 2>/dev/null || true)"
   [ -z "$BREW" ] && return 1
-  BREW_PREFIX="$("$BREW" --prefix 2>/dev/null)"
+  # Префикс выводится из пути, а не из `brew --prefix`: brew — скрипт в
+  # каталоге пользователя, и от root его исполнять нельзя.
+  BREW_PREFIX="$(dirname "$(dirname "$BREW")")"
   [ -z "$BREW_PREFIX" ] && return 1
   DNSMASQ_BIN="$BREW_PREFIX/sbin/dnsmasq"
   return 0
 }
 
-use_prefix() {
-  local candidate="${1:-}"
-  if [ -n "$candidate" ]; then
-    # Безопасность: не принимаем произвольные каталоги вне белого списка Homebrew
-    if [ -z "${CERBERUS_SOURCE_ONLY:-}" ]; then
-      case "$candidate" in
-        /opt/homebrew|/usr/local|"$HOME/.homebrew"|"$HOME/homebrew") ;;
-        *)
-          local real_brew_prefix=""
-          if command -v brew >/dev/null 2>&1; then
-            real_brew_prefix="$(brew --prefix 2>/dev/null || true)"
-          fi
-          if [ -n "$real_brew_prefix" ] && [ "$candidate" = "$real_brew_prefix" ]; then
-            :
-          else
-            fail "Недопустимый путь Homebrew: $candidate"
-            return 1
-          fi
-          ;;
-      esac
-    fi
-    BREW_PREFIX="$candidate"
-  elif [ -r "$PREFIX_FILE" ]; then
-    local stored; stored="$(cat "$PREFIX_FILE" 2>/dev/null || true)"
-    case "$stored" in
-      /opt/homebrew|/usr/local|"$HOME/.homebrew"|"$HOME/homebrew") BREW_PREFIX="$stored" ;;
-      *)
-        if [ -z "${CERBERUS_SOURCE_ONLY:-}" ]; then
-          find_brew || return 1
-        else
-          BREW_PREFIX="$stored"
-        fi
-        ;;
-    esac
-  else
-    find_brew || return 1
-    return 0
-  fi
-  BREW="$BREW_PREFIX/bin/brew"
-  DNSMASQ_BIN="$BREW_PREFIX/sbin/dnsmasq"
+# Префикс Homebrew нельзя принимать из аргументов. Помощник вызывается через
+# sudo без пароля, и `--apply-full /tmp/x` ставил LaunchDaemon, который
+# запускал от root `/tmp/x/sbin/dnsmasq`.
+
+# Конфиг и база лежат в каталоге состояния, принадлежащем root, а не в
+# $BREW_PREFIX/etc: dnsmasq исполняет директивы конфига от root
+# (dhcp-script=…), и правка файла пользователем давала root.
+conf_path()      { printf '%s/dnsmasq.conf' "$STATE_DIR"; }
+blocklist_path() { printf '%s/blocklist.conf' "$STATE_DIR"; }
+
+# Копирует dnsmasq из Homebrew в root-каталог. Вызывается только по явному
+# действию — включению локального режима — или однократно для перехода со
+# старой установки, а не при каждом запуске.
+install_root_dnsmasq() {
+  if [ "${1:-}" != "refresh" ] && [ -x "$DNSMASQ_RUN" ]; then return 0; fi
+  [ -n "$DNSMASQ_BIN" ] || find_brew || return 1
+  [ -x "$DNSMASQ_BIN" ] || return 1
+  $SUDO mkdir -p "$(dirname "$DNSMASQ_RUN")" 2>/dev/null
+  $SUDO install -o root -g wheel -m 0755 "$DNSMASQ_BIN" "$DNSMASQ_RUN"
+}
+
+# Каталог состояния: root:wheel 0755. Если его создал кто-то другой, правила
+# и конфиг в нём мог бы переписать непривилегированный процесс.
+make_state_dir() {
+  $SUDO mkdir -p "$STATE_DIR" 2>/dev/null
+  $SUDO chown root:wheel "$STATE_DIR" 2>/dev/null
+  $SUDO chmod 0755 "$STATE_DIR" 2>/dev/null
   return 0
 }
 
-conf_path()      { printf '%s/etc/dnsmasq.conf' "$BREW_PREFIX"; }
-blocklist_path() { printf '%s/etc/adblock-dns/blocklist.conf' "$BREW_PREFIX"; }
+# Пользователь, которому выдаётся право на помощник. Под `do shell script …
+# with administrator privileges` SUDO_USER не задан, и раньше право уходило
+# всей группе admin.
+helper_user() {
+  local u="${SUDO_USER:-}"
+  if [ -z "$u" ] || [ "$u" = "root" ]; then
+    u="$(stat -f %Su /dev/console 2>/dev/null)"
+  fi
+  case "$u" in ""|root|loginwindow) return 1 ;; esac
+  printf '%s' "$u"
+}
 
+# Без аргумента только обновляет уже установленный помощник. Раньше любой
+# вызов от root — смена профиля, сброс кэша — ставил его заново, даже если
+# человек его удалил.
 ensure_privileged_helper() {
   [ "$(id -u)" -eq 0 ] || return 0
+  [ "${1:-}" = "install" ] || [ -f "$HELPER_BIN" ] || return 0
 
-  local helper_bin="/usr/local/bin/dnsblock-engine"
-  local sudoers_file="/etc/sudoers.d/dnsblocker_helper"
+  local helper_bin="$HELPER_BIN"
+  local sudoers_file="$HELPER_SUDOERS"
   local self_path target_user
 
   # Путь к самому себе, а не заранее вписанный путь к папке разработчика.
@@ -156,22 +165,30 @@ HEOF
   chown root:wheel "$helper_bin" 2>/dev/null || true
   chmod 0755 "$helper_bin" 2>/dev/null || true
 
-  # Право выдаётся конкретному пользователю, а не всей группе admin.
-  target_user="${SUDO_USER:-}"
-  if [ -n "$target_user" ] && [ "$target_user" != "root" ]; then
-    printf '%s ALL=(ALL) NOPASSWD: %s\n' "$target_user" "$helper_bin" > "$sudoers_file"
-  else
-    printf '%%admin ALL=(ALL) NOPASSWD: %s\n' "$helper_bin" > "$sudoers_file"
+  # Право выдаётся конкретному пользователю и никогда — всей группе admin.
+  # Если пользователя не определить, прежнее правило остаётся как есть.
+  if ! target_user="$(helper_user)"; then
+    [ "${1:-}" = "install" ] && return 1
+    return 0
   fi
-  chown root:wheel "$sudoers_file" 2>/dev/null || true
-  chmod 0440 "$sudoers_file" 2>/dev/null || true
 
-  # Битый файл в sudoers.d ломает sudo для всей системы — проверяем и откатываем.
-  if ! visudo -cf "$sudoers_file" >/dev/null 2>&1; then
-    rm -f "$sudoers_file"
+  # Файл собирается рядом и проверяется до замены: битый файл в sudoers.d
+  # ломает sudo для всей системы.
+  local tmp_sudoers="$sudoers_file.new"
+  printf '%s ALL=(ALL) NOPASSWD: %s\n' "$target_user" "$helper_bin" > "$tmp_sudoers"
+  chown root:wheel "$tmp_sudoers" 2>/dev/null || true
+  chmod 0440 "$tmp_sudoers" 2>/dev/null || true
+  if ! visudo -cf "$tmp_sudoers" >/dev/null 2>&1; then
+    rm -f "$tmp_sudoers"
     return 1
   fi
+  mv -f "$tmp_sudoers" "$sudoers_file"
   return 0
+}
+
+# Удаляет помощник целиком: обёртку, root-копию движка и правило sudoers.
+remove_privileged_helper() {
+  $SUDO rm -f "$HELPER_BIN" "$HELPER_SUDOERS" "$HELPER_SUDOERS.new" "$LIBEXEC"
 }
 
 # ─────────── СЕТЕВЫЕ СЕРВИСЫ ───────────
@@ -339,7 +356,15 @@ PYPING
 convert_list() {
   local src="$1" dst="$2"
   if grep -qE '^[[:space:]]*(address|local|server)=' "$src" 2>/dev/null; then
-    tr -d '\r' < "$src" | grep -E '^[[:space:]]*(address|local|server)=' > "$dst"
+    # Из чужого списка берутся только строки, которые блокируют домен.
+    # Прежде строки server=/домен/IP и address=/домен/IP проходили как есть,
+    # и подменённый список мог увести любой сайт, хоть банк, на свой адрес.
+    # Список скачивается и применяется от root без участия человека.
+    LC_ALL=C tr -d '\r' < "$src" | LC_ALL=C awk '
+      { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); $0 = tolower($0) }
+      /^(address|local)=\/[a-z0-9_-]+(\.[a-z0-9_-]+)+\/(#|0\.0\.0\.0|::)?$/ {
+        if (!seen[$0]++) print
+      }' > "$dst"
   else
     LC_ALL=C awk '
       { sub(/\r$/, "") }
@@ -366,10 +391,12 @@ build_blocklist() {
     say "    источник: $url"
     if curl -fsSL --max-time 180 "$url" -o "$tmp/raw" 2>/dev/null && [ -s "$tmp/raw" ]; then
       if convert_list "$tmp/raw" "$tmp/list.conf"; then
-        if "$DNSMASQ_BIN" --test --conf-file="$tmp/list.conf" >/dev/null 2>&1; then
+        if "$DNSMASQ_RUN" --test --conf-file="$tmp/list.conf" >/dev/null 2>&1; then
           n="$(wc -l < "$tmp/list.conf" | tr -d ' ')"
-          mkdir -p "$(dirname "$out")" 2>/dev/null || $SUDO mkdir -p "$(dirname "$out")"
-          if ! mv "$tmp/list.conf" "$out" 2>/dev/null; then $SUDO cp "$tmp/list.conf" "$out"; fi
+          $SUDO mkdir -p "$(dirname "$out")" 2>/dev/null
+          # Через временный файл рядом: работающий dnsmasq не должен увидеть
+          # недописанную базу.
+          $SUDO cp "$tmp/list.conf" "$out.new" && $SUDO chmod 0644 "$out.new" && $SUDO mv -f "$out.new" "$out"
           rm -rf "$tmp"; ok "список готов: $n доменов"; return 0
         fi
       fi
@@ -381,26 +408,32 @@ build_blocklist() {
 
 # ─────────── КОНФИГ И СЛУЖБЫ ───────────
 
+# Конфиг собирается во временном файле и заменяет рабочий только после
+# `dnsmasq --test`. Раньше он перезаписывался на месте, и при неудачной
+# проверке битый файл оставался: следующий перезапуск службы оставлял систему
+# с DNS 127.0.0.1, на котором никто не отвечает.
 write_conf() {
-  local conf blocklist effective_blocklist
+  local conf blocklist effective_blocklist out wdom bdom
   conf="$(conf_path)"; blocklist="$(blocklist_path)"
-  mkdir -p "$(dirname "$conf")" 2>/dev/null
-  if [ -f "$conf" ] && [ ! -f "$conf.adblock-backup" ]; then cp "$conf" "$conf.adblock-backup" 2>/dev/null; fi
+  # На установке прежней версии root-копии ещё нет, а проверять конфиг
+  # нечем — без этого правка правил там просто не применялась бы.
+  install_root_dnsmasq || return 1
+  out="$(mktemp)" || return 1
 
   local u1="$UPSTREAM_1" u2="$UPSTREAM_2"
   if [ -s "$STATE_DIR/upstreams" ]; then
     local line1 line2
     line1="$(sed -n '1p' "$STATE_DIR/upstreams" 2>/dev/null | tr -d '[:space:]')"
     line2="$(sed -n '2p' "$STATE_DIR/upstreams" 2>/dev/null | tr -d '[:space:]')"
-    [ -n "$line1" ] && u1="$line1"
-    [ -n "$line2" ] && u2="$line2"
+    valid_upstream "$line1" && u1="$line1"
+    valid_upstream "$line2" && u2="$line2"
   fi
 
   # Создаем файл журнала с правами 0644 для доступа GUI без root
   $SUDO touch "$QUERY_LOG" 2>/dev/null || touch "$QUERY_LOG" 2>/dev/null || true
   $SUDO chmod 0644 "$QUERY_LOG" 2>/dev/null || chmod 0644 "$QUERY_LOG" 2>/dev/null || true
 
-  cat > "$conf" <<EOF
+  cat > "$out" <<EOF
 # adblock-dns v$VERSION — $(date '+%Y-%m-%d %H:%M')
 # Конфигурация локального DNS-фильтра dnsmasq
 
@@ -427,21 +460,23 @@ EOF
 
   # Добавляем белый список (перенаправление на апстрим без блокировки)
   if [ -s "$WHITELIST_FILE" ]; then
-    printf '\n# Пользовательский белый список\n' >> "$conf"
+    printf '\n# Пользовательский белый список\n' >> "$out"
+    # Строки проверяются и здесь: файл мог остаться от версии без проверки
+    # ввода, и одна мусорная строка валила бы весь конфиг.
     while IFS= read -r wdom; do
       wdom="$(echo "$wdom" | tr -d '[:space:]')"
-      [ -z "$wdom" ] && continue
-      printf 'server=/%s/%s\n' "$wdom" "$u1" >> "$conf"
+      valid_domain "$wdom" || continue
+      printf 'server=/%s/%s\n' "$wdom" "$u1" >> "$out"
     done < "$WHITELIST_FILE"
   fi
 
   # Добавляем черный список
   if [ -s "$BLACKLIST_FILE" ]; then
-    printf '\n# Пользовательский черный список\n' >> "$conf"
+    printf '\n# Пользовательский черный список\n' >> "$out"
     while IFS= read -r bdom; do
       bdom="$(echo "$bdom" | tr -d '[:space:]')"
-      [ -z "$bdom" ] && continue
-      printf 'address=/%s/#\n' "$bdom" >> "$conf"
+      valid_domain "$bdom" || continue
+      printf 'address=/%s/#\n' "$bdom" >> "$out"
     done < "$BLACKLIST_FILE"
   fi
 
@@ -456,7 +491,7 @@ EOF
   # у Chromium повышает соединение до DoH того же провайдера, фильтрация при
   # этом сохраняется, и мешать этому смысла нет.
   if [ -f "$DOH_MARK" ]; then
-    printf '\n# Блокировка стороннего DNS-over-HTTPS\n' >> "$conf"
+    printf '\n# Блокировка стороннего DNS-over-HTTPS\n' >> "$out"
     local d
     for d in use-application-dns.net \
              mozilla.cloudflare-dns.com chrome.cloudflare-dns.com \
@@ -466,7 +501,7 @@ EOF
              dns.quad9.net dns9.quad9.net dns11.quad9.net \
              dns.nextdns.io doh.cleanbrowsing.org \
              doh.dns.sb dns.alidns.com doh.360.cn; do
-      printf 'address=/%s/\n' "$d" >> "$conf"
+      printf 'address=/%s/\n' "$d" >> "$out"
     done
   fi
 
@@ -474,7 +509,7 @@ EOF
   # уметь отдать tailnet-имена: /etc/resolver перехватывает не все обращения,
   # программа может спросить 127.0.0.1 напрямую.
   if [ -f "$TS_MARK" ]; then
-    printf '\n# Зона Tailscale\nserver=/ts.net/%s\n' "$TS_DNS" >> "$conf"
+    printf '\n# Зона Tailscale\nserver=/ts.net/%s\n' "$TS_DNS" >> "$out"
   fi
 
   effective_blocklist="$blocklist"
@@ -488,10 +523,47 @@ EOF
         print
       }' "$WHITELIST_FILE" "$blocklist" > "$effective_blocklist" 2>/dev/null || effective_blocklist="$blocklist"
     fi
-    printf '\nconf-file=%s\n' "$effective_blocklist" >> "$conf"
+    printf '\nconf-file=%s\n' "$effective_blocklist" >> "$out"
   fi
 
-  "$DNSMASQ_BIN" --test --conf-file="$conf" >/dev/null 2>&1
+  if ! "$DNSMASQ_RUN" --test --conf-file="$out" >/dev/null 2>&1; then
+    rm -f "$out"
+    return 1
+  fi
+  $SUDO mkdir -p "$(dirname "$conf")" 2>/dev/null
+  $SUDO cp "$out" "$conf.new" && $SUDO chmod 0644 "$conf.new" && $SUDO mv -f "$conf.new" "$conf"
+  local rc=$?
+  rm -f "$out"
+  return $rc
+}
+
+# Применяет новый конфиг. Служба, поставленная прежней версией, запускает
+# dnsmasq и конфиг из каталога Homebrew — её переставляем целиком, иначе она
+# так и осталась бы на файлах, доступных пользователю на запись.
+reload_service() {
+  if [ -f "$DNS_PLIST" ] && ! grep -qF "$DNSMASQ_RUN" "$DNS_PLIST"; then
+    install_root_dnsmasq || return 1
+    migrate_legacy_blocklist && write_conf
+    start_service
+    return
+  fi
+  $SUDO launchctl kickstart -k "system/$DNS_LABEL" >/dev/null 2>&1
+}
+
+# Перенос базы из каталога Homebrew, где её держали прежние версии. Файл там
+# доступен пользователю на запись, поэтому он проходит тот же фильтр, что и
+# скачанный список: в root-конфиг попадают только блокирующие строки.
+migrate_legacy_blocklist() {
+  [ -s "$(blocklist_path)" ] && return 0
+  [ -n "$BREW_PREFIX" ] || find_brew || return 1
+  local legacy="$BREW_PREFIX/etc/adblock-dns/blocklist.conf" tmp
+  [ -s "$legacy" ] || return 1
+  tmp="$(mktemp)" || return 1
+  if convert_list "$legacy" "$tmp"; then
+    $SUDO cp "$tmp" "$(blocklist_path)" && $SUDO chmod 0644 "$(blocklist_path)"
+  fi
+  rm -f "$tmp"
+  [ -s "$(blocklist_path)" ]
 }
 
 stop_service() {
@@ -500,8 +572,16 @@ stop_service() {
   return 0
 }
 
+# Служба dnsmasq из `brew services` останавливается через launchctl, а не
+# вызовом brew: brew — скрипт в каталоге пользователя, и запуск его от root
+# исполнял бы файл, который может переписать любой процесс пользователя.
+stop_brew_service() {
+  $SUDO launchctl bootout system/homebrew.mxcl.dnsmasq >/dev/null 2>&1
+  return 0
+}
+
 start_service() {
-  [ -n "$BREW" ] && $SUDO "$BREW" services stop dnsmasq >/dev/null 2>&1
+  stop_brew_service
   stop_service
   $SUDO tee "$DNS_PLIST" >/dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -511,7 +591,7 @@ start_service() {
   <key>Label</key><string>$DNS_LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$DNSMASQ_BIN</string>
+    <string>$DNSMASQ_RUN</string>
     <string>--keep-in-foreground</string>
     <string>--conf-file=$(conf_path)</string>
   </array>
@@ -531,8 +611,11 @@ EOF
 
 install_updater() {
   $SUDO mkdir -p "$(dirname "$LIBEXEC")" 2>/dev/null
-  $SUDO cp "$SELF" "$LIBEXEC" 2>/dev/null || return 1
-  $SUDO chmod 755 "$LIBEXEC"
+  # Через помощника скрипт и так запущен из $LIBEXEC. Копирование файла в
+  # самого себя завершалось ошибкой, и фоновое обновление не ставилось вовсе.
+  if [ "$SELF" != "$LIBEXEC" ]; then
+    $SUDO install -o root -g wheel -m 0755 "$SELF" "$LIBEXEC" 2>/dev/null || return 1
+  fi
   $SUDO tee "$UPD_PLIST" >/dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -673,8 +756,8 @@ PYDOH
 
 doh_block_apply() {
   # Правила живут в конфиге dnsmasq, поэтому нужен локальный режим.
-  if [ "$(get_mode)" = "full" ] && use_prefix "" && [ -x "$DNSMASQ_BIN" ]; then
-    write_conf && launchctl kickstart -k "system/$DNS_LABEL" >/dev/null 2>&1
+  if [ "$(get_mode)" = "full" ] && install_root_dnsmasq; then
+    write_conf && reload_service
     flush_dns
     return 0
   fi
@@ -819,12 +902,8 @@ cmd_tailscale_split_off() {
 # В интерфейсе кнопка «Перезапустить службу» была подписана верно,
 # но выполняла лишь обновление статуса.
 cmd_restart_service() {
-  if ! use_prefix ""; then
-    fail "Homebrew не найден — локальный dnsmasq не установлен"
-    return 1
-  fi
-  if [ ! -x "$DNSMASQ_BIN" ]; then
-    fail "dnsmasq не установлен ($DNSMASQ_BIN)"
+  if ! install_root_dnsmasq; then
+    fail "dnsmasq не установлен (brew install dnsmasq)"
     return 1
   fi
   if [ "$(get_mode)" != "full" ]; then
@@ -843,6 +922,14 @@ cmd_restart_service() {
 
 cmd_query_log_json() {
   local limit="${1:-200}"
+  # Только число и до проверки журнала. Значение подставлялось в $(( )), а
+  # bash вычисляет строку в арифметике как выражение: `a[$(команда)]`
+  # выполнял команду от root через беспарольный помощник.
+  case "$limit" in
+    ""|*[!0-9]*) printf '[]\n'; return 2 ;;
+  esac
+  limit=$((10#$limit))
+  [ "$limit" -ge 1 ] && [ "$limit" -le 2000 ] || { printf '[]\n'; return 2; }
   if [ ! -r "$QUERY_LOG" ]; then
     printf '[]\n'
     return 0
@@ -978,11 +1065,11 @@ cmd_status_json() {
   pgrep -x dnsmasq >/dev/null 2>&1 && running="true"
   
   domains=0; updated=""
-  if use_prefix "" && [ -f "$(blocklist_path)" ]; then
+  if [ -f "$(blocklist_path)" ]; then
     domains="$(wc -l < "$(blocklist_path)" | tr -d ' ')"
     updated="$(date -r "$(blocklist_path)" '+%d.%m.%Y %H:%M' 2>/dev/null)"
   fi
-  
+
   # Проба идёт через системный резолвер — то есть проверяет ровно тот путь,
   # которым ходят браузер и приложения.
   probe="$(resolve_a doubleclick.net)"
@@ -1090,7 +1177,7 @@ cmd_status() {
   done < <(active_services)
   running=no; pgrep -x dnsmasq >/dev/null 2>&1 && running=yes
   domains=0; updated=""
-  if use_prefix "" && [ -f "$(blocklist_path)" ]; then
+  if [ -f "$(blocklist_path)" ]; then
     domains="$(wc -l < "$(blocklist_path)" | tr -d ' ')"
     updated="$(date -r "$(blocklist_path)" '+%d.%m.%Y %H:%M' 2>/dev/null)"
   fi
@@ -1180,7 +1267,7 @@ cmd_apply_profile() {
       set_mode quick custom
       ;;
     local_dnsmasq|full)
-      cmd_apply_full "${2:-}" || return 1
+      cmd_apply_full || return 1
       set_mode full local_dnsmasq
       ;;
     off)
@@ -1202,11 +1289,17 @@ cmd_prepare_full() {
   find_brew || { fail "Homebrew не найден"; return 3; }
   step "Проверяю dnsmasq"
   if [ -x "$DNSMASQ_BIN" ]; then ok "dnsmasq уже установлен"
+  elif [ "$(id -u)" -eq 0 ]; then
+    # brew от root не запускается, да и не должен: это скрипт, который может
+    # переписать любой процесс пользователя.
+    fail "dnsmasq не установлен — выполните без sudo: brew install dnsmasq"; return 1
   else
     "$BREW" install dnsmasq || { fail "не удалось установить dnsmasq"; return 1; }
     [ -x "$DNSMASQ_BIN" ] || { fail "dnsmasq не нашёлся после установки"; return 1; }
     ok "dnsmasq установлен"
   fi
+  make_state_dir
+  install_root_dnsmasq refresh || { fail "не удалось скопировать dnsmasq в $DNSMASQ_RUN"; return 1; }
   step "Скачиваю базу рекламных доменов"
   build_blocklist "$(blocklist_path)" || { fail "ни один список не скачался"; return 1; }
   step "Формирую конфигурацию"
@@ -1215,10 +1308,24 @@ cmd_prepare_full() {
   return 0
 }
 
+# Аргументов не принимает: путь к Homebrew из командной строки позволял
+# запустить от root любой файл (см. conf_path).
 cmd_apply_full() {
-  use_prefix "${1:-}" || { fail "не нашёл Homebrew"; return 1; }
-  [ -x "$DNSMASQ_BIN" ] || { fail "dnsmasq не установлен"; return 1; }
-  $SUDO mkdir -p "$STATE_DIR"; printf '%s\n' "$BREW_PREFIX" | $SUDO tee "$PREFIX_FILE" >/dev/null
+  find_brew || { fail "не нашёл Homebrew"; return 1; }
+  [ -x "$DNSMASQ_BIN" ] || { fail "dnsmasq не установлен (brew install dnsmasq)"; return 1; }
+  make_state_dir
+  # Копия обновляется при каждом явном включении режима — так подхватывается
+  # новая версия dnsmasq после `brew upgrade`.
+  install_root_dnsmasq refresh || { fail "не удалось скопировать dnsmasq в $DNSMASQ_RUN"; return 1; }
+
+  # Приложение включает режим одной этой командой и `--prepare-full` не
+  # вызывает. Без этих шагов dnsmasq стартовал без базы и без конфига,
+  # то есть ничего не блокировал.
+  if [ ! -s "$(blocklist_path)" ]; then
+    step "Скачиваю базу рекламных доменов"
+    build_blocklist "$(blocklist_path)" || { fail "ни один список не скачался — настройки сети не изменены"; return 1; }
+  fi
+  write_conf || { fail "конфиг не прошёл проверку — настройки сети не изменены"; return 1; }
 
   step "Запускаю службу dnsmasq"
   start_service || { fail "служба не запустилась, лог: /var/log/adblock-dns.log"; return 1; }
@@ -1253,8 +1360,7 @@ cmd_apply_quick() {
 
 cmd_apply_off() {
   restore_dns
-  use_prefix "" 2>/dev/null
-  [ -n "$BREW" ] && $SUDO "$BREW" services stop dnsmasq >/dev/null 2>&1
+  stop_brew_service
   stop_service
   flush_dns
   $SUDO rm -f "$MODE_FILE" "$PROFILE_FILE"
@@ -1275,36 +1381,32 @@ cmd_apply_remove() {
   $SUDO launchctl bootout "system/$UPD_LABEL" >/dev/null 2>&1
   $SUDO launchctl unload -w "$UPD_PLIST" >/dev/null 2>&1
   stop_service
-  $SUDO rm -f "$UPD_PLIST" "$DNS_PLIST" "$LIBEXEC" "$QUERY_LOG" /var/log/adblock-dns-update.log /var/log/adblock-dns.log
-  if use_prefix "${1:-}" 2>/dev/null && [ -n "$BREW_PREFIX" ]; then
-    if [ -x "$BREW" ]; then
-      $SUDO "$BREW" services stop dnsmasq >/dev/null 2>&1
-    fi
-    local conf; conf="$(conf_path)"
-    [ -f "$conf.adblock-backup" ] && mv -f "$conf.adblock-backup" "$conf" 2>/dev/null
-    case "$BREW_PREFIX" in
-      /opt/homebrew|/usr/local|"$HOME/.homebrew"|"$HOME/homebrew")
-        rm -rf "$BREW_PREFIX/etc/adblock-dns" 2>/dev/null || $SUDO rm -rf "$BREW_PREFIX/etc/adblock-dns"
-        ;;
-      *)
-        if [ -n "${CERBERUS_SOURCE_ONLY:-}" ]; then
-          rm -rf "$BREW_PREFIX/etc/adblock-dns" 2>/dev/null || true
-        fi
-        ;;
-    esac
+  stop_brew_service
+  $SUDO rm -f "$UPD_PLIST" "$DNS_PLIST" "$QUERY_LOG" /var/log/adblock-dns-update.log /var/log/adblock-dns.log
+  $SUDO rm -rf "$(dirname "$DNSMASQ_RUN")"
+  # Следы прежних версий, которые писали конфиг прямо в каталог Homebrew.
+  if find_brew; then
+    local legacy="$BREW_PREFIX/etc/dnsmasq.conf"
+    [ -f "$legacy.adblock-backup" ] && mv -f "$legacy.adblock-backup" "$legacy" 2>/dev/null
+    rm -rf "$BREW_PREFIX/etc/adblock-dns" 2>/dev/null || $SUDO rm -rf "$BREW_PREFIX/etc/adblock-dns"
   fi
   $SUDO rm -rf "$STATE_DIR"
+  # Помощник удаляется вместе со всем остальным. Раньше обёртка и правило
+  # sudoers оставались, хотя FAQ обещал полное удаление.
+  remove_privileged_helper
   ok "DNS-блокировщик полностью удалён, настройки сети восстановлены"
   return 0
 }
 
 cmd_update() {
-  use_prefix "" || exit 1
-  [ -x "$DNSMASQ_BIN" ] || exit 1
+  install_root_dnsmasq || exit 1
   echo "[$(date '+%F %T')] Запуск обновления списка..."
   if build_blocklist "$(blocklist_path)"; then
-    write_conf
-    launchctl kickstart -k "system/$DNS_LABEL" >/dev/null 2>&1
+    # Без проверенного конфига службу не трогаем: рабочий файл остался прежним.
+    if ! write_conf; then
+      echo "[$(date '+%F %T')] Конфиг не прошёл проверку, служба не перезапущена"; exit 1
+    fi
+    reload_service
     echo "[$(date '+%F %T')] Обновление успешно завершено"; exit 0
   fi
   echo "[$(date '+%F %T')] Ошибка обновления базы"; exit 1
@@ -1449,6 +1551,32 @@ PYSPEED
 # Пользовательские правила попадают прямо в dnsmasq.conf. Мусорная строка
 # делала конфиг невалидным: `dnsmasq --test` падал, служба не перезапускалась,
 # а при следующем старте локальный резолвер уже не поднимался.
+# Вышестоящий DNS: IPv4 или IPv6, по желанию с портом через # (как пишет dnsmasq).
+valid_upstream() {
+  local a="${1:-}" host port="" o
+  host="${a%%#*}"
+  [ "$host" != "$a" ] && port="${a#*#}"
+  if [ "$host" != "$a" ]; then
+    case "$port" in ""|*[!0-9]*) return 1 ;; esac
+    [ ${#port} -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  fi
+  case "$host" in
+    *:*)
+      case "$host" in *[!0-9a-fA-F:]*|*:::*) return 1 ;; esac
+      [ ${#host} -le 39 ] || return 1
+      return 0 ;;
+    *[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+  local IFS=.
+  # shellcheck disable=SC2086
+  set -- $host
+  [ $# -eq 4 ] || return 1
+  for o in "$@"; do
+    [ ${#o} -le 3 ] && [ "$o" -le 255 ] || return 1
+  done
+  return 0
+}
+
 valid_domain() {
   local d="$1"
   [ -n "$d" ] || return 1
@@ -1482,11 +1610,11 @@ cmd_add_whitelist() {
   fi
   $SUDO mkdir -p "$STATE_DIR"
   $SUDO touch "$WHITELIST_FILE"
-  if ! grep -qx "$dom" "$WHITELIST_FILE" 2>/dev/null; then
+  if ! grep -qxF -- "$dom" "$WHITELIST_FILE" 2>/dev/null; then
     printf '%s\n' "$dom" | $SUDO tee -a "$WHITELIST_FILE" >/dev/null
   fi
   if [ "$(get_mode)" = "full" ]; then
-    use_prefix "" && write_conf && launchctl kickstart -k "system/$DNS_LABEL" >/dev/null 2>&1
+    write_conf && reload_service
   fi
   ok "Домен $dom добавлен в белый список"
 }
@@ -1496,7 +1624,7 @@ cmd_remove_whitelist() {
   [ -z "$dom" ] || [ ! -f "$WHITELIST_FILE" ] && return 0
   remove_domain_line "$WHITELIST_FILE" "$dom"
   if [ "$(get_mode)" = "full" ]; then
-    use_prefix "" && write_conf && launchctl kickstart -k "system/$DNS_LABEL" >/dev/null 2>&1
+    write_conf && reload_service
   fi
   ok "Домен $dom удален из белого списка"
 }
@@ -1517,11 +1645,11 @@ cmd_add_blacklist() {
   fi
   $SUDO mkdir -p "$STATE_DIR"
   $SUDO touch "$BLACKLIST_FILE"
-  if ! grep -qx "$dom" "$BLACKLIST_FILE" 2>/dev/null; then
+  if ! grep -qxF -- "$dom" "$BLACKLIST_FILE" 2>/dev/null; then
     printf '%s\n' "$dom" | $SUDO tee -a "$BLACKLIST_FILE" >/dev/null
   fi
   if [ "$(get_mode)" = "full" ]; then
-    use_prefix "" && write_conf && launchctl kickstart -k "system/$DNS_LABEL" >/dev/null 2>&1
+    write_conf && reload_service
   fi
   ok "Домен $dom добавлен в черный список"
 }
@@ -1531,7 +1659,7 @@ cmd_remove_blacklist() {
   [ -z "$dom" ] || [ ! -f "$BLACKLIST_FILE" ] && return 0
   remove_domain_line "$BLACKLIST_FILE" "$dom"
   if [ "$(get_mode)" = "full" ]; then
-    use_prefix "" && write_conf && launchctl kickstart -k "system/$DNS_LABEL" >/dev/null 2>&1
+    write_conf && reload_service
   fi
   ok "Домен $dom удален из черного списка"
 }
@@ -1834,10 +1962,15 @@ SELF="$0"
 # команды. Используется набором проверок.
 cmd_set_upstreams() {
   local u1="${1:-1.1.1.1}" u2="${2:-1.0.0.1}"
+  # Значения попадают в конфиг dnsmasq, который работает от root.
+  if ! valid_upstream "$u1" || ! valid_upstream "$u2"; then
+    fail "Вышестоящий DNS должен быть IP-адресом (можно с #порт): «$u1», «$u2»"
+    return 2
+  fi
   $SUDO mkdir -p "$STATE_DIR"
   printf '%s\n%s\n' "$u1" "$u2" | $SUDO tee "$STATE_DIR/upstreams" >/dev/null
   if [ "$(get_mode)" = "full" ]; then
-    use_prefix "" && write_conf && launchctl kickstart -k "system/$DNS_LABEL" >/dev/null 2>&1
+    write_conf && reload_service
   fi
   ok "Вышестоящие DNS обновлены: $u1, $u2"
 }
@@ -2078,6 +2211,14 @@ cmd_vpn_core_stop() {
 
 cmd_vpn_core_status_json() {
   local sb ver="" running="false" listening="false" sub_host="" age="-1" orphan="false" svc s_out
+  # Статус запускает найденный sing-box, а среди мест поиска есть каталоги
+  # пользователя (/opt/homebrew/bin). Через беспарольный помощник это root:
+  # положи туда файл — и он исполнится от root. Приложение спрашивает статус
+  # от пользователя, как и все остальные команды ядра.
+  if [ "$(id -u)" -eq 0 ]; then
+    fail "Команды VPN-ядра выполняются от пользователя, не от root"
+    return 1
+  fi
   sb="$(find_singbox || true)"
   [ -n "$sb" ] && ver="$("$sb" version 2>/dev/null | awk 'NR==1{print $3}')"
   launchctl print "gui/$(id -u)/$VPN_AGENT_LABEL" >/dev/null 2>&1 && running="true"
@@ -2132,15 +2273,15 @@ case "${1:-}" in
   --status-text)         cmd_status_text ;;
   --brew-prefix)         find_brew && printf '%s\n' "$BREW_PREFIX" ;;
   --prepare-full)        cmd_prepare_full ;;
-  --apply-full)          cmd_apply_full "${2:-}" ;;
+  --apply-full)          cmd_apply_full ;;
   --apply-quick)         cmd_apply_quick ;;
   --apply-profile)       cmd_apply_profile "${2:-adguard}" "${3:-}" ;;
   --apply-off)           cmd_apply_off ;;
-  --apply-remove)        cmd_apply_remove "${2:-}" ;;
+  --apply-remove)        cmd_apply_remove ;;
   --flush-dns)           flush_dns; ok "DNS кэш успешно очищен" ;;
-  --install-helper)      ensure_privileged_helper; ok "Привилегированный помощник установлен" ;;
-  --remove-helper)       rm -f /usr/local/bin/dnsblock-engine /etc/sudoers.d/dnsblocker_helper "$LIBEXEC"; ok "Помощник удален" ;;
-  --full)                cmd_prepare_full && cmd_apply_full "$BREW_PREFIX" ;;
+  --install-helper)      if ensure_privileged_helper install; then ok "Привилегированный помощник установлен"; else fail "Не удалось установить помощник"; exit 1; fi ;;
+  --remove-helper)       remove_privileged_helper; ok "Помощник удален" ;;
+  --full)                cmd_prepare_full && cmd_apply_full ;;
   --update)              cmd_update ;;
   --test-domains-json)   cmd_test_domains_json ;;
   --test-speed-json)     cmd_test_speed_json ;;

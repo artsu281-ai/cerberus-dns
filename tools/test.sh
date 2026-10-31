@@ -192,28 +192,30 @@ if [ -z "$DNSMASQ_TEST_BIN" ]; then
   echo "  ⚠ dnsmasq не установлен — проверка пропущена (brew install dnsmasq)"
 else
   SB="$TMP/sandbox"
-  mkdir -p "$SB/state" "$SB/prefix/etc/adblock-dns"
+  mkdir -p "$SB/state"
+  # Последняя строка — мусор, оставшийся от версии без проверки ввода.
+  # Она должна быть пропущена, а не валить весь конфиг.
   printf 'good.example
 allow.example
+bad/entry
 ' > "$SB/state/whitelist.txt"
   printf 'bad.example
 block.example
 '  > "$SB/state/blacklist.txt"
   printf 'address=/tracker.example/#
 address=/good.example/#
-'   > "$SB/prefix/etc/adblock-dns/blocklist.conf"
+'   > "$SB/state/blocklist.conf"
   : > "$SB/state/block_doh"       # правила блокировки DoH
   : > "$SB/state/tailscale_split" # зона Tailscale
   CERBERUS_SOURCE_ONLY=1 CERBERUS_STATE_DIR="$SB/state" \
   bash -c '
     source "'"$ROOT"'/Contents/Resources/engine.sh"
-    BREW_PREFIX="'"$SB"'/prefix"
-    DNSMASQ_BIN="'"$DNSMASQ_TEST_BIN"'"
+    DNSMASQ_RUN="'"$DNSMASQ_TEST_BIN"'"
     SUDO=""
     write_conf
   ' >"$TMP/wc.log" 2>&1
   rc=$?
-  conf="$SB/prefix/etc/dnsmasq.conf"
+  conf="$SB/state/dnsmasq.conf"
   bad=0
   if [ "$rc" -ne 0 ]; then
     echo "  ✘ write_conf вернул $rc"; sed 's/^/    /' "$TMP/wc.log" | head -5; bad=1
@@ -227,20 +229,117 @@ address=/good.example/#
   grep -q '^log-queries'                "$conf" && echo "  ✔ журнал запросов включён"      || { echo "  ✘ журнал запросов выключен"; bad=1; }
   "$DNSMASQ_TEST_BIN" --test -C "$conf" >/dev/null 2>&1 && echo "  ✔ конфиг принят настоящим dnsmasq" || { echo "  ✘ dnsmasq отверг конфиг"; bad=1; }
   # Проверка, что домен из белого списка исключён из активной базы правил
-  if [ -f "$SB/prefix/etc/adblock-dns/blocklist.active.conf" ]; then
-    grep -q 'good.example' "$SB/prefix/etc/adblock-dns/blocklist.active.conf" && { echo "  ✘ домен белого списка остался в базе блокировки"; bad=1; } || echo "  ✔ домен белого списка исключён из базы блокировки"
+  if [ -f "$SB/state/blocklist.active.conf" ]; then
+    grep -q 'good.example' "$SB/state/blocklist.active.conf" && { echo "  ✘ домен белого списка остался в базе блокировки"; bad=1; } || echo "  ✔ домен белого списка исключён из базы блокировки"
+  else
+    echo "  ✘ активная база без белого списка не создана"; bad=1
+  fi
+  grep -q 'bad/entry' "$conf" && { echo "  ✘ мусорная строка правил попала в конфиг"; bad=1; } || echo "  ✔ мусорная строка правил пропущена"
+
+  # Если новая сборка не прошла проверку, рабочий конфиг должен остаться прежним.
+  cp "$conf" "$TMP/conf.before"
+  printf 'dhcp-range=не-адрес\n' > "$SB/state/blocklist.conf"
+  CERBERUS_SOURCE_ONLY=1 CERBERUS_STATE_DIR="$SB/state" \
+  bash -c '
+    source "'"$ROOT"'/Contents/Resources/engine.sh"
+    DNSMASQ_RUN="'"$DNSMASQ_TEST_BIN"'"
+    SUDO=""
+    write_conf
+  ' >/dev/null 2>&1
+  rc2=$?
+  if [ "$rc2" -ne 0 ] && cmp -s "$conf" "$TMP/conf.before"; then
+    echo "  ✔ конфиг, не прошедший проверку, рабочий не заменил"
+  else
+    echo "  ✘ битый конфиг заменил рабочий (код $rc2)"; bad=1
   fi
   [ "$bad" -eq 0 ] || fails=$((fails + 1))
 fi
 
 echo
-echo "── engine.sh: безопасность use_prefix (LPE защита) ──"
-if bash -c 'CERBERUS_SOURCE_ONLY=1 source "'"$ROOT"'/Contents/Resources/engine.sh" >/dev/null 2>&1; CERBERUS_SOURCE_ONLY="" use_prefix "/tmp/evil" >/dev/null 2>&1'; then
-  echo "  ✘ префикс /tmp/evil был принят!"
-  fails=$((fails + 1))
+echo "── engine.sh: помощник не исполняет ввод ──"
+# Помощник вызывается через sudo без пароля, поэтому любой аргумент — это
+# ввод от непривилегированного процесса.
+bad=0
+canary="$TMP/pwned"
+# Журнал подставляется настоящий: без него функция выходила бы раньше
+# арифметики, и проверка проходила бы и на уязвимом коде. Имя переменной —
+# существующее (PATH): с несуществующим `set -u` обрывал разбор раньше
+# подстановки, и проверка тоже ничего бы не ловила.
+: > "$TMP/query.log"
+out="$(CERBERUS_SOURCE_ONLY=1 bash -c 'source "$1"; QUERY_LOG="$2"; cmd_query_log_json "$3"' _ \
+  "$ROOT/Contents/Resources/engine.sh" "$TMP/query.log" 'PATH[$(touch '"$canary"')]' 2>/dev/null)"
+if [ -e "$canary" ]; then
+  echo "  ✘ --query-log-json выполнил подставленную команду"; bad=1
 else
-  echo "  ✔ префикс /tmp/evil отвергнут"
+  echo "  ✔ --query-log-json не выполняет подставленную команду"
 fi
+[ "$out" = "[]" ] && echo "  ✔ на неверный лимит отвечает пустым списком" || { echo "  ✘ ответ на неверный лимит: $out"; bad=1; }
+# Путь к Homebrew из аргумента давал LaunchDaemon, запускающий чужой файл от root.
+if grep -nE 'cmd_apply_full "|cmd_apply_remove "|BREW_PREFIX="\$1"|PREFIX_FILE' "$ROOT/Contents/Resources/engine.sh"; then
+  echo "  ✘ путь к Homebrew снова берётся из аргументов или файла"; bad=1
+else
+  echo "  ✔ путь к Homebrew из аргументов не принимается"
+fi
+if grep -nE '\$SUDO "\$BREW"|"\$BREW" --prefix' "$ROOT/Contents/Resources/engine.sh"; then
+  echo "  ✘ brew запускается от root"; bad=1
+else
+  echo "  ✔ brew от root не запускается"
+fi
+if grep -nE '^[^#]*%admin' "$ROOT/Contents/Resources/engine.sh"; then
+  echo "  ✘ право на помощник снова выдаётся всей группе admin"; bad=1
+else
+  echo "  ✔ право на помощник — только одному пользователю"
+fi
+[ "$bad" -eq 0 ] || fails=$((fails + 1))
+
+echo
+echo "── engine.sh: из списков блокировки берутся только блокирующие строки ──"
+bad=0
+{
+  i=0; while [ $i -lt 1005 ]; do printf 'local=/ad%d.example.com/\n' "$i"; i=$((i + 1)); done
+  printf 'address=/tracker.example/#\naddress=/pixel.example/0.0.0.0\nADDRESS=/Upper.Example/\n'
+  printf 'server=/bank.example/6.6.6.6\naddress=/bank.example/6.6.6.6\n'
+  printf 'local=/evil.example/\ndhcp-script=/tmp/x\n'
+  printf 'address=/a.example/b.example/#\naddress=/x.example/#  # хвост\n'
+} > "$TMP/list.raw"
+CERBERUS_SOURCE_ONLY=1 bash -c 'source "$1"; convert_list "$2" "$3"' _ \
+  "$ROOT/Contents/Resources/engine.sh" "$TMP/list.raw" "$TMP/list.conf"
+has()  { grep -qxF "$1" "$TMP/list.conf" && echo "  ✔ оставлена: $1" || { echo "  ✘ потеряна: $1"; bad=1; }; }
+hasnt(){ grep -qF  "$1" "$TMP/list.conf" && { echo "  ✘ пропущена: $1"; bad=1; } || echo "  ✔ отброшена: $1"; }
+has   'local=/ad1.example.com/'
+has   'address=/tracker.example/#'
+has   'address=/pixel.example/0.0.0.0'
+has   'address=/upper.example/'
+has   'local=/evil.example/'
+hasnt '6.6.6.6'
+hasnt 'server='
+hasnt 'dhcp-script'
+hasnt 'b.example'
+hasnt 'x.example'
+[ "$bad" -eq 0 ] || fails=$((fails + 1))
+
+echo
+echo "── engine.sh: вышестоящие DNS — только IP-адреса ──"
+bad=0
+mkdir -p "$TMP/ups"
+for v in "/bank.example/6.6.6.6" "dhcp-script=/tmp/x" "1.1.1" "1.1.1.1 2.2.2.2"; do
+  CERBERUS_SOURCE_ONLY=1 CERBERUS_STATE_DIR="$TMP/ups" bash -c 'source "$1"; SUDO=""; cmd_set_upstreams "1.1.1.1" "$2"' _ \
+    "$ROOT/Contents/Resources/engine.sh" "$v" >/dev/null 2>&1
+  if [ -e "$TMP/ups/upstreams" ]; then echo "  ✘ принят: $v"; bad=1; rm -f "$TMP/ups/upstreams"; else echo "  ✔ отвергнут: $v"; fi
+done
+CERBERUS_SOURCE_ONLY=1 CERBERUS_STATE_DIR="$TMP/ups" bash -c 'source "$1"; SUDO=""; cmd_set_upstreams "9.9.9.9" "2606:4700:4700::1111#53"' _ \
+  "$ROOT/Contents/Resources/engine.sh" >/dev/null 2>&1
+[ "$(cat "$TMP/ups/upstreams" 2>/dev/null)" = "9.9.9.9
+2606:4700:4700::1111#53" ] && echo "  ✔ IPv4 и IPv6 с портом приняты" || { echo "  ✘ корректные адреса не сохранились"; bad=1; }
+# Статус VPN-ядра запускает найденный sing-box, в том числе из /opt/homebrew/bin,
+# который принадлежит пользователю. От root (через помощник) он запускаться не должен.
+if sed -n '/^cmd_vpn_core_status_json() {/,/^}/p' "$ROOT/Contents/Resources/engine.sh" \
+     | awk '/id -u/ && !guard {guard=NR} /find_singbox/ && !found {found=NR} END {exit !(guard && found && guard < found)}'; then
+  echo "  ✔ статус VPN-ядра не запускает sing-box от root"
+else
+  echo "  ✘ статус VPN-ядра может запустить sing-box от root"; bad=1
+fi
+[ "$bad" -eq 0 ] || fails=$((fails + 1))
 
 echo
 if [ "$fails" -eq 0 ]; then
